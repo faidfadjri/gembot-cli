@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -19,9 +20,25 @@ const workspaceDir = "workspace"
 // serverManager tracks the currently running background server process
 var serverManager = struct {
 	sync.Mutex
-	cmd  *exec.Cmd
-	port string
+	cmd        *exec.Cmd
+	port       string
+	projectDir string
 }{}
+
+// activeProject tracks the last project gemini was working in
+var activeProject struct {
+	sync.RWMutex
+	dir string // absolute path to the project folder inside workspace
+}
+
+// sessionTracker tracks which projects have had at least one message
+// during the CURRENT bot run. Resets to empty on every restart.
+var sessionTracker = struct {
+	sync.Mutex
+	projects map[string]bool
+}{
+	projects: make(map[string]bool),
+}
 
 func main() {
 	if err := godotenv.Load(); err != nil {
@@ -36,7 +53,7 @@ func main() {
 	if err := os.MkdirAll(workspaceDir, 0755); err != nil {
 		log.Fatalf("Failed to create workspace directory: %v", err)
 	}
-	log.Printf("Workspace directory ready: %s", workspaceDir)
+	log.Printf("Workspace ready: %s", workspaceDir)
 
 	bot, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
@@ -73,7 +90,6 @@ func handleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
 	case isStatusCommand(text):
 		replyText = handleServerStatus()
 	default:
-		// Everything else goes to Gemini CLI
 		output, err := runGeminiCLI(text)
 		if err != nil {
 			if output != "" {
@@ -88,7 +104,6 @@ func handleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
 		}
 	}
 
-	// Telegram has a 4096 character limit per message
 	if len(replyText) > 4096 {
 		replyText = replyText[:4090] + "\n[...]"
 	}
@@ -100,11 +115,81 @@ func handleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
 	}
 }
 
+// --- Project Name Extraction ---
+
+var buildPatterns = []*regexp.Regexp{
+	// "build/create/make a coffee-website" / "build coffee website project"
+	regexp.MustCompile(`(?i)(?:build|create|make|setup|init|start)\s+(?:a\s+|an\s+|the\s+)?([a-zA-Z0-9][\w\s-]{1,40}?)\s+(?:website|web\s*app|app|page|project|site|landing\s*page)`),
+	// "coffee website" / "todo app" as standalone phrase
+	regexp.MustCompile(`(?i)([a-zA-Z0-9][\w\s-]{1,40}?)\s+(?:website|web\s*app|app|page|project|site)`),
+}
+
+// extractProjectSlug tries to derive a filesystem-safe project folder name.
+// Returns "" if no project name can be found.
+func extractProjectSlug(text string) string {
+	for _, re := range buildPatterns {
+		m := re.FindStringSubmatch(text)
+		if len(m) >= 2 {
+			slug := toSlug(m[1])
+			if slug != "" && slug != "a" && slug != "the" && slug != "an" {
+				return slug
+			}
+		}
+	}
+	return ""
+}
+
+func toSlug(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	// Replace spaces and underscores with hyphens
+	s = strings.NewReplacer(" ", "-", "_", "-").Replace(s)
+	// Remove non-alphanumeric/hyphen characters
+	safe := regexp.MustCompile(`[^a-z0-9-]`).ReplaceAllString(s, "")
+	// Collapse multiple hyphens
+	safe = regexp.MustCompile(`-{2,}`).ReplaceAllString(safe, "-")
+	return strings.Trim(safe, "-")
+}
+
+// resolveProjectDir returns the directory gemini should run in for this prompt.
+// If a project name is found → workspace/<slug>/
+// Otherwise → last used project, or workspace/ root.
+func resolveProjectDir(text string) string {
+	slug := extractProjectSlug(text)
+	if slug != "" {
+		dir := workspaceDir + "/" + slug
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			log.Printf("Warning: could not create project dir %s: %v", dir, err)
+			return workspaceDir
+		}
+		log.Printf("Project dir resolved: %s", dir)
+		// Update active project
+		activeProject.Lock()
+		activeProject.dir = dir
+		activeProject.Unlock()
+		return dir
+	}
+
+	// Fall back to last active project (for follow-up messages like "Yes sure")
+	activeProject.RLock()
+	last := activeProject.dir
+	activeProject.RUnlock()
+
+	if last != "" {
+		return last
+	}
+	return workspaceDir
+}
+
 // --- Server Management ---
 
 func isRunCommand(text string) bool {
 	lower := strings.ToLower(text)
-	keywords := []string{"run the website", "run the server", "start the website", "start the server", "npm start", "npm run", "jalankan website", "jalankan server"}
+	keywords := []string{
+		"run the website", "run the server", "run the app",
+		"start the website", "start the server", "start the app",
+		"npm start", "npm run",
+		"jalankan website", "jalankan server", "jalankan app",
+	}
 	for _, kw := range keywords {
 		if strings.Contains(lower, kw) {
 			return true
@@ -129,41 +214,46 @@ func handleStartServer() string {
 	serverManager.Lock()
 	defer serverManager.Unlock()
 
-	// Kill any existing server first
+	// Determine which project dir to serve
+	activeProject.RLock()
+	projectDir := activeProject.dir
+	activeProject.RUnlock()
+
+	if projectDir == "" {
+		projectDir = workspaceDir
+	}
+
+	// Kill any existing server
 	if serverManager.cmd != nil && serverManager.cmd.Process != nil {
 		serverManager.cmd.Process.Kill()
 		serverManager.cmd = nil
-		log.Println("Killed previous server process")
 	}
 
-	// Detect port from package.json (default: 8000)
-	port := detectPort()
+	port := detectPort(projectDir)
 
-	// Start npm start as a background process (non-blocking)
 	cmd := exec.Command("npm", "start")
-	cmd.Dir = workspaceDir
+	cmd.Dir = projectDir
 
 	if err := cmd.Start(); err != nil {
-		log.Printf("Failed to start server: %v", err)
-		return fmt.Sprintf("❌ Failed to start server: %v\n\nMake sure npm is installed and package.json exists in the workspace.", err)
+		return fmt.Sprintf("❌ Failed to start server: %v\n\nMake sure package.json exists in the project folder.", err)
 	}
 
 	serverManager.cmd = cmd
 	serverManager.port = port
+	serverManager.projectDir = projectDir
 
-	// Watch for unexpected crash in background
 	go func() {
 		err := cmd.Wait()
 		serverManager.Lock()
-		if serverManager.cmd == cmd { // only if it's still our process
-			log.Printf("Server process exited: %v", err)
+		if serverManager.cmd == cmd {
+			log.Printf("Server exited: %v", err)
 			serverManager.cmd = nil
 		}
 		serverManager.Unlock()
 	}()
 
-	log.Printf("Server started on port %s (PID %d)", port, cmd.Process.Pid)
-	return fmt.Sprintf("🚀 Server started!\n\nAccess it at: http://localhost:%s\n\nTo stop the server, send: stop server", port)
+	log.Printf("Server started at http://localhost:%s (project: %s, PID: %d)", port, projectDir, cmd.Process.Pid)
+	return fmt.Sprintf("🚀 Server started!\n\n📁 Project: %s\n🌐 URL: http://localhost:%s\n\nSend \"stop server\" to shut it down.", projectDir, port)
 }
 
 func handleStopServer() string {
@@ -173,14 +263,15 @@ func handleStopServer() string {
 	if serverManager.cmd == nil || serverManager.cmd.Process == nil {
 		return "ℹ️ No server is currently running."
 	}
-
 	if err := serverManager.cmd.Process.Kill(); err != nil {
 		return fmt.Sprintf("❌ Failed to stop server: %v", err)
 	}
-	serverManager.cmd = nil
 	port := serverManager.port
+	dir := serverManager.projectDir
+	serverManager.cmd = nil
 	serverManager.port = ""
-	return fmt.Sprintf("🛑 Server on port %s has been stopped.", port)
+	serverManager.projectDir = ""
+	return fmt.Sprintf("🛑 Server stopped.\n\n📁 Project: %s\n🌐 Was running on port %s", dir, port)
 }
 
 func handleServerStatus() string {
@@ -188,18 +279,17 @@ func handleServerStatus() string {
 	defer serverManager.Unlock()
 
 	if serverManager.cmd != nil && serverManager.cmd.Process != nil {
-		return fmt.Sprintf("✅ Server is running on http://localhost:%s", serverManager.port)
+		return fmt.Sprintf("✅ Server is running\n\n📁 Project: %s\n🌐 http://localhost:%s", serverManager.projectDir, serverManager.port)
 	}
 	return "ℹ️ No server is currently running."
 }
 
-func detectPort() string {
-	data, err := os.ReadFile(workspaceDir + "/package.json")
+func detectPort(dir string) string {
+	data, err := os.ReadFile(dir + "/package.json")
 	if err != nil {
 		return "8000"
 	}
 	content := string(data)
-	// Simple scan for port number after -p flag in scripts
 	if idx := strings.Index(content, "-p "); idx != -1 {
 		rest := content[idx+3:]
 		port := ""
@@ -220,16 +310,34 @@ func detectPort() string {
 // --- Gemini CLI ---
 
 func runGeminiCLI(input string) (string, error) {
+	projectDir := resolveProjectDir(input)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// -p = headless/non-interactive mode (required so it doesn't hang)
-	// --yolo = auto-approve all tool calls (file write, shell commands, etc.)
-	// --resume latest = continue previous session (memory/context)
-	cmd := exec.CommandContext(ctx, "gemini", "-p", input, "--yolo", "--resume", "latest")
-	cmd.Dir = workspaceDir
+	// Determine if this is the first message to this project in the current bot run.
+	// First message → fresh session (no --resume).
+	// Follow-up messages → resume to maintain context.
+	sessionTracker.Lock()
+	isFirstMessage := !sessionTracker.projects[projectDir]
+	if isFirstMessage {
+		sessionTracker.projects[projectDir] = true
+	}
+	sessionTracker.Unlock()
 
-	log.Printf("Running gemini: %q", input)
+	args := []string{"-p", input, "--yolo"}
+	if !isFirstMessage {
+		args = append(args, "--resume", "latest")
+	}
+
+	cmd := exec.CommandContext(ctx, "gemini", args...)
+	cmd.Dir = projectDir
+
+	if isFirstMessage {
+		log.Printf("Running gemini (fresh session) in [%s]: %q", projectDir, input)
+	} else {
+		log.Printf("Running gemini (resuming session) in [%s]: %q", projectDir, input)
+	}
 
 	out, err := cmd.CombinedOutput()
 	result := cleanOutput(string(out))
@@ -248,7 +356,6 @@ func cleanOutput(raw string) string {
 		"No previous sessions found for this project.",
 		"Warning: 256-color support not detected. Using a terminal with at least 256-color support is recommended for a better visual experience.",
 	}
-
 	lines := strings.Split(raw, "\n")
 	var cleaned []string
 	for _, line := range lines {
