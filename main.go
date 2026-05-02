@@ -78,7 +78,19 @@ func handleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
 	text := strings.TrimSpace(message.Text)
 	log.Printf("[%s] %s", message.From.UserName, text)
 
-	bot.Send(tgbotapi.NewChatAction(message.Chat.ID, tgbotapi.ChatTyping))
+	// Keep "typing..." alive every 4 seconds until we have a response.
+	// Telegram removes the indicator after ~5s if not refreshed.
+	typingDone := make(chan struct{})
+	go func() {
+		for {
+			bot.Send(tgbotapi.NewChatAction(message.Chat.ID, tgbotapi.ChatTyping))
+			select {
+			case <-typingDone:
+				return
+			case <-time.After(4 * time.Second):
+			}
+		}
+	}()
 
 	var replyText string
 
@@ -104,6 +116,8 @@ func handleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
 		}
 	}
 
+	close(typingDone) // stop the typing indicator goroutine
+
 	if len(replyText) > 4096 {
 		replyText = replyText[:4090] + "\n[...]"
 	}
@@ -117,35 +131,37 @@ func handleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
 
 // --- Project Name Extraction ---
 
-var buildPatterns = []*regexp.Regexp{
-	// "build/create/make a coffee-website" / "build coffee website project"
-	regexp.MustCompile(`(?i)(?:build|create|make|setup|init|start)\s+(?:a\s+|an\s+|the\s+)?([a-zA-Z0-9][\w\s-]{1,40}?)\s+(?:website|web\s*app|app|page|project|site|landing\s*page)`),
-	// "coffee website" / "todo app" as standalone phrase
-	regexp.MustCompile(`(?i)([a-zA-Z0-9][\w\s-]{1,40}?)\s+(?:website|web\s*app|app|page|project|site)`),
-}
+// buildTriggers requires the message to START with an explicit action verb
+// so that regular conversation doesn't get mistaken for project creation.
+var buildTriggers = regexp.MustCompile(
+	`(?i)^(?:build|create|make|setup|init(?:ialize)?)\s+(?:a\s+|an\s+|me\s+a\s+|me\s+an\s+)?([\w][\w ]{0,24}?)\s+(?:website|web\s*app|webapp|app|page|project|site|landing\s*page)`,
+)
 
 // extractProjectSlug tries to derive a filesystem-safe project folder name.
-// Returns "" if no project name can be found.
+// Only triggers on explicit build/create/make commands at the start of the message.
+// Returns "" for regular conversation or ambiguous messages.
 func extractProjectSlug(text string) string {
-	for _, re := range buildPatterns {
-		m := re.FindStringSubmatch(text)
-		if len(m) >= 2 {
-			slug := toSlug(m[1])
-			if slug != "" && slug != "a" && slug != "the" && slug != "an" {
-				return slug
-			}
-		}
+	m := buildTriggers.FindStringSubmatch(strings.TrimSpace(text))
+	if len(m) < 2 {
+		return ""
 	}
-	return ""
+	slug := toSlug(m[1])
+	// Guard against noise words or single chars
+	if len(slug) < 2 || slug == "a" || slug == "an" || slug == "the" || slug == "my" {
+		return ""
+	}
+	// Clamp slug to 3 words max (joined by hyphens)
+	parts := strings.SplitN(slug, "-", 4)
+	if len(parts) > 3 {
+		parts = parts[:3]
+	}
+	return strings.Join(parts, "-")
 }
 
 func toSlug(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
-	// Replace spaces and underscores with hyphens
 	s = strings.NewReplacer(" ", "-", "_", "-").Replace(s)
-	// Remove non-alphanumeric/hyphen characters
 	safe := regexp.MustCompile(`[^a-z0-9-]`).ReplaceAllString(s, "")
-	// Collapse multiple hyphens
 	safe = regexp.MustCompile(`-{2,}`).ReplaceAllString(safe, "-")
 	return strings.Trim(safe, "-")
 }
@@ -349,27 +365,83 @@ func runGeminiCLI(input string) (string, error) {
 	return result, err
 }
 
+// noisyExact are lines removed only when they match exactly (trimmed).
+var noisyExact = []string{
+	"Ripgrep is not available. Falling back to GrepTool.",
+	"YOLO mode is enabled. All tool calls will be automatically approved.",
+	"No previous sessions found for this project.",
+	"Warning: 256-color support not detected. Using a terminal with at least 256-color support is recommended for a better visual experience.",
+}
+
+// noisyPrefix are lines removed when they START WITH these strings.
+var noisyPrefix = []string{
+	"at ",           // JS stack trace frames: "    at Object.<anonymous>"
+	"var consoleProcessList", // conpty_console_list_agent.js
+	"                 ^",    // JS syntax error caret
+	"Node.js v",      // "Node.js v24.14.0"
+	"Error: AttachConsole failed", // pty attach error
+	"Error executing tool",  // gemini internal tool errors
+	"Attempt ",       // "Attempt 1 failed with status 429..."
+}
+
+// noisyContains are lines removed when they CONTAIN these substrings.
+var noisyContains = []string{
+	"conpty_console_list_agent.js",
+	"node_modules/@google/gemini-cli",
+	"node_modules/@lydell/node-pty",
+	"node:internal/",
+	"_GaxiosError",
+	"retryWithBackoff",
+	"streamWithRetries",
+	"makeApiCallAndProcessStream",
+}
+
 func cleanOutput(raw string) string {
-	noisy := []string{
-		"Ripgrep is not available. Falling back to GrepTool.",
-		"YOLO mode is enabled. All tool calls will be automatically approved.",
-		"No previous sessions found for this project.",
-		"Warning: 256-color support not detected. Using a terminal with at least 256-color support is recommended for a better visual experience.",
+	// Check for rate-limit / capacity errors and replace with friendly message
+	if strings.Contains(raw, "No capacity available") || strings.Contains(raw, "RESOURCE_EXHAUSTED") || strings.Contains(raw, "rateLimitExceeded") {
+		return "⚠️ Gemini API rate limit reached. Please wait a moment and try again."
 	}
+
 	lines := strings.Split(raw, "\n")
 	var cleaned []string
+
 	for _, line := range lines {
 		trimmed := strings.TrimRight(line, "\r")
+		trimmedSpace := strings.TrimSpace(trimmed)
 		skip := false
-		for _, n := range noisy {
-			if strings.TrimSpace(trimmed) == n {
+
+		// Exact match
+		for _, n := range noisyExact {
+			if trimmedSpace == n {
 				skip = true
 				break
 			}
 		}
+
+		// Prefix match
+		if !skip {
+			for _, p := range noisyPrefix {
+				if strings.HasPrefix(trimmedSpace, p) {
+					skip = true
+					break
+				}
+			}
+		}
+
+		// Substring match
+		if !skip {
+			for _, c := range noisyContains {
+				if strings.Contains(trimmed, c) {
+					skip = true
+					break
+				}
+			}
+		}
+
 		if !skip {
 			cleaned = append(cleaned, trimmed)
 		}
 	}
+
 	return strings.TrimSpace(strings.Join(cleaned, "\n"))
 }
